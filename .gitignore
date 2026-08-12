@@ -1,0 +1,11 @@
+# 密钥与环境
+.env
+
+# 虚拟环境与依赖缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 运行时数据（工作区/检查点/追踪）
+.mokioclaw/
