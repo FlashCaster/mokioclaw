@@ -71,11 +71,42 @@ def callback(
             if text:
                 console.print(f"[bold yellow]💭 Think #{loop}[/bold yellow] [dim]{text[:200]}[/dim]")
 
+        elif etype == "plan_snapshot":
+            console.print()
+            lines = []
+            summary = event.get("plan_summary", "")
+            if summary:
+                lines.append(f"[bold cyan]{summary}[/bold cyan]")
+            todos = event.get("todos", [])
+            if todos:
+                lines.append("[bold]Todos:[/bold]")
+                for t in todos:
+                    lines.append(f"  - [dim]{t.get('id','')}[/dim] {t.get('content','')}")
+            criteria = event.get("acceptance_criteria", [])
+            if criteria:
+                lines.append("[bold]Acceptance:[/bold]")
+                for c in criteria:
+                    lines.append(f"  - {c}")
+            commands = event.get("verification_commands", [])
+            if commands:
+                lines.append("[bold]Verification:[/bold]")
+                for c in commands:
+                    lines.append(f"  - [dim]{c}[/dim]")
+            console.print(
+                Panel(
+                    "\n".join(lines) if lines else "(empty plan)",
+                    title="[bold magenta]📋 Plan[/bold magenta]",
+                    border_style="magenta",
+                )
+            )
+
         elif etype == "tool_call":
+            node = event.get("node", "actor")
+            node_tag = "[dim][planner][/dim] " if node == "planner" else ""
             args_str = ", ".join(
                 f"{k}={repr(v)[:60]}" for k, v in event["args"].items()
             )
-            console.print(f"  [bold green]🔧 {event['name']}[/bold green]({args_str})")
+            console.print(f"  {node_tag}[bold green]🔧 {event['name']}[/bold green]({args_str})")
 
         elif etype == "tool_result":
             result = event["result"]
