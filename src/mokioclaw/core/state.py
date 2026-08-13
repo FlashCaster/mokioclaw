@@ -12,6 +12,7 @@ class RuntimeState:
     """
 
     workspace: Path = field(default_factory=Path.cwd)
+    approval_mode: str = "inline"
 
     @property
     def workspace_str(self) -> str:

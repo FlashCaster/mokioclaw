@@ -5,9 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def get_project_root() -> Path:
-    """Return the project root (where pyproject.toml lives)."""
-    return Path(__file__).resolve().parent.parent.parent.parent
+def get_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    if current.is_file():
+        current = current.parent
+    for candidate in (current, *current.parents):
+        if (candidate / "pyproject.toml").exists() or (candidate / ".git").exists():
+            return candidate
+    return current
 
 
 def create_workspace(base_dir: Path | None = None) -> Path:
@@ -59,3 +64,6 @@ def resolve_workspace_path(workspace: Path, file_path: str) -> Path:
         )
 
     return resolved
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)

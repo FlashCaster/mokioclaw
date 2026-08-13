@@ -30,6 +30,11 @@ def callback(
         "--workspace",
         help="Workspace directory (auto-created if not provided)",
     ),
+    approval_mode: str = typer.Option(
+        "inline",
+        "--approval-mode",
+        help="Approval mode for high-risk bash commands: inline / deny / auto"
+    )
 ) -> None:
     """Run the MokioClaw ReAct agent on a task.
 
@@ -45,7 +50,7 @@ def callback(
     )
     console.print(f"[dim]Task:[/dim] {task}\n")
 
-    state = RuntimeState(workspace=ws)
+    state = RuntimeState(workspace=ws, approval_mode=approval_mode)
     tools = build_tools(state)
 
     # Show available tools
@@ -106,7 +111,7 @@ def callback(
 @app.command()
 def list_tools() -> None:
     """List all available tools with descriptions."""
-    state = RuntimeState(workspace=Path.cwd())
+    state = RuntimeState(workspace=Path.cwd(), approval_mode="inline")
     tools = build_tools(state)
 
     table = Table(title="MokioClaw Tools")
