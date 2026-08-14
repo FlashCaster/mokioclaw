@@ -70,3 +70,41 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
             ),
         ),
     ]
+
+
+def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
+    """Build read-only tools for the verifier (no write/edit tools).
+
+    The verifier may read files, grep, and run shell checks, but cannot
+    modify the workspace — preventing "check" from becoming "fix in disguise".
+    """
+    return [
+        StructuredTool.from_function(
+            name="FileReadTool",
+            description="Read a text file from the workspace. Use to inspect results.",
+            func=lambda file_path, offset=0, limit=2000: read_file(
+                state, file_path, offset, limit
+            ),
+        ),
+        StructuredTool.from_function(
+            name="GrepTool",
+            description=(
+                "Search for a regex pattern in workspace files. "
+                "Use to locate code, find definitions, or check for patterns."
+            ),
+            func=lambda pattern, path=".", glob="*", head_limit=20, ignore_case=True: grep(
+                state, pattern, path, glob, head_limit, ignore_case
+            ),
+        ),
+        StructuredTool.from_function(
+            name="BashTool",
+            description=(
+                "Execute a read-only shell command inside the workspace. "
+                "Use to run verification commands and check results. "
+                "Do NOT use this to modify files."
+            ),
+            func=lambda command, timeout_seconds=120: run_bash(
+                state, command, timeout_seconds
+            ),
+        ),
+    ]
