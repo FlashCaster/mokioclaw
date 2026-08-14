@@ -2,6 +2,10 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mokioclaw.core.trace import TraceWriter
 
 
 @dataclass
@@ -13,6 +17,8 @@ class RuntimeState:
 
     workspace: Path = field(default_factory=Path.cwd)
     approval_mode: str = "inline"
+    checkpoint_mode: str = "light"  # light / strict / off
+    trace: Any = None  # TraceWriter | None（旁路观测）
 
     @property
     def workspace_str(self) -> str:

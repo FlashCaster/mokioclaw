@@ -10,8 +10,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from mokioclaw.core.checkpoint import load_checkpoint, save_checkpoint
 from mokioclaw.core.paths import create_workspace
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.trace import TraceWriter
 from mokioclaw.graph.workflow import build_workflow
 from mokioclaw.tools.registry import build_tools
 
@@ -21,6 +23,17 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
+
+
+def _find_latest_workspace(base_dir: Path) -> "Path | None":
+    """在 base_dir/.mokioclaw/workspaces/ 下找最近修改的 workspace（供 --resume 使用）。"""
+    workspaces_dir = base_dir / ".mokioclaw" / "workspaces"
+    if not workspaces_dir.exists():
+        return None
+    dirs = [d for d in workspaces_dir.iterdir() if d.is_dir()]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: d.stat().st_mtime)
 
 
 def _render_messages(messages) -> None:
@@ -65,23 +78,78 @@ def callback(
     approval_mode: str = typer.Option(
         "inline", "--approval-mode", help="Approval mode for high-risk bash: inline / deny / auto"
     ),
+    checkpoint_mode: str = typer.Option(
+        "light", "--checkpoint-mode", help="Checkpoint mode: light / strict / off"
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Resume from the latest checkpoint in the workspace"
+    ),
 ) -> None:
     """Run the MokioClaw planner→actor→verifier agent on a task."""
-    if task is None:
+    if task is None and not resume:
         app.get_command(None)
         raise typer.Exit()
 
-    ws = workspace.resolve() if workspace else create_workspace()
-    console.print(Panel.fit(f"[bold cyan]{ws}[/bold cyan]", title="MokioClaw Stage 2 · Workspace"))
-    console.print(f"[dim]Task:[/dim] {task}\n")
+    # 解析 workspace：resume 时优先用最近一次 workspace
+    if workspace is not None:
+        ws = workspace.resolve()
+    elif resume:
+        latest = _find_latest_workspace(Path.cwd())
+        if latest is None:
+            console.print("[red]No workspace found to resume.[/red]")
+            raise typer.Exit(code=1)
+        ws = latest
+    else:
+        ws = create_workspace()
 
-    state = RuntimeState(workspace=ws, approval_mode=approval_mode)
+    trace = TraceWriter(ws)
+    state = RuntimeState(
+        workspace=ws,
+        approval_mode=approval_mode,
+        checkpoint_mode=checkpoint_mode,
+        trace=trace,
+    )
+
+    initial: dict = {"task": task or "", "runtime": state, "max_attempts": 3, "attempts": 0}
+
+    # resume：从最新检查点恢复关键状态
+    if resume:
+        loaded = load_checkpoint(state)
+        if not loaded.get("ok"):
+            console.print(f"[yellow]无法恢复检查点：{loaded.get('error', '')}[/yellow]")
+        else:
+            recovered = loaded.get("state", {})
+            for key in (
+                "task", "todos", "plan_summary", "acceptance_criteria",
+                "verification_commands", "attempts", "passed", "verifier_summary",
+                "recommended_next_instruction", "agent_handoffs", "sources",
+                "code_agent_summary", "research_notes",
+            ):
+                if key in recovered and recovered[key] is not None:
+                    initial[key] = recovered[key]
+            console.print(
+                Panel(
+                    loaded.get("recovery", "") or "(no recovery notes)",
+                    title=f"[bold cyan]Resume · {loaded.get('id', '')} · {loaded.get('ts', '')}[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+
+    console.print(Panel.fit(f"[bold cyan]{ws}[/bold cyan]", title="MokioClaw · Workspace"))
+    console.print(f"[dim]Task:[/dim] {initial['task']}")
+    console.print(
+        f"[dim]Checkpoint: {checkpoint_mode} ｜ Trace: on ｜ Approval: {approval_mode}[/dim]\n"
+    )
+
+    trace.record("run_start", task=initial["task"], checkpoint_mode=checkpoint_mode)
 
     graph = build_workflow()
-    initial = {"task": task, "runtime": state, "max_attempts": 3, "attempts": 0}
+    merged_state: dict = dict(initial)
 
     for step in graph.stream(initial):
         for node_name, data in step.items():
+            merged_state.update(data)
+            trace.record("node_start", node=node_name)
             if node_name == "planner":
                 console.print()
                 lines = []
@@ -142,6 +210,19 @@ def callback(
                         border_style="green",
                     )
                 )
+
+            # 节点结束：trace + checkpoint（旁路观测，不改变 agent 行为）
+            trace.record("node_end", node=node_name)
+            ckpt = save_checkpoint(state, merged_state, node=node_name)
+            if ckpt.get("ok") and not ckpt.get("skipped"):
+                trace.record(
+                    "checkpoint",
+                    node=node_name,
+                    id=ckpt.get("id"),
+                    mode=ckpt.get("mode"),
+                )
+
+    trace.finalize(merged_state)
 
 
 @app.command()

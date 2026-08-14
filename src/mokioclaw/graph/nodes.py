@@ -158,6 +158,13 @@ def _call_code_agent_tool(working_state: dict, instruction: str) -> dict[str, An
 def _execute_planner_tool(working_state: dict, call: dict[str, Any]) -> ToolMessage:
     name = call.get("name", "")
     args = call.get("args") or {}
+    trace = working_state["runtime"].trace
+    if trace:
+        trace.record_tool_call("planner", name, args)
+        if name == "CallSearchAgentTool":
+            trace.record_handoff("planner", "searchAgent", str(args.get("instruction", "")))
+        elif name == "CallCodeAgentTool":
+            trace.record_handoff("planner", "codeAgent", str(args.get("instruction", "")))
     tools = {tool.name: tool for tool in _build_planner_tools(working_state)}
     tool = tools.get(name)
     if tool is None:
@@ -167,6 +174,8 @@ def _execute_planner_tool(working_state: dict, call: dict[str, Any]) -> ToolMess
             result = tool.invoke(args)
         except Exception as exc:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if trace:
+        trace.record_tool_result("planner", name, bool(result.get("ok")), str(result.get("error", "")))
     return ToolMessage(
         content=json.dumps(result, ensure_ascii=False, default=str),
         name=name,
@@ -235,6 +244,8 @@ def actor_node(state: MokioGraphState) -> dict[str, Any]:
             break
         for tc in tool_calls:
             name = tc.get("name", "")
+            if working_state["runtime"].trace:
+                working_state["runtime"].trace.record_tool_call("actor", name, tc.get("args", {}))
             tool = tool_map.get(name)
             if tool is None:
                 result = {"ok": False, "error": f"Unknown tool: {name}"}
@@ -243,6 +254,10 @@ def actor_node(state: MokioGraphState) -> dict[str, Any]:
                     result = tool.invoke(tc.get("args", {}))
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if working_state["runtime"].trace:
+                working_state["runtime"].trace.record_tool_result(
+                    "actor", name, bool(result.get("ok")), str(result.get("error", ""))
+                )
             produced.append(
                 ToolMessage(
                     content=json.dumps(result, ensure_ascii=False, default=str),
@@ -277,6 +292,8 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
             break
         for tc in tool_calls:
             name = tc.get("name", "")
+            if state["runtime"].trace:
+                state["runtime"].trace.record_tool_call("verifier", name, tc.get("args", {}))
             tool = tool_map.get(name)
             if tool is None:
                 result = {"ok": False, "error": f"Unknown tool: {name}"}
@@ -285,6 +302,10 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
                     result = tool.invoke(tc.get("args", {}))
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if state["runtime"].trace:
+                state["runtime"].trace.record_tool_result(
+                    "verifier", name, bool(result.get("ok")), str(result.get("error", ""))
+                )
             produced.append(
                 ToolMessage(
                     content=json.dumps(result, ensure_ascii=False, default=str),
