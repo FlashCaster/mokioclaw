@@ -72,3 +72,10 @@ class MokioGraphState(TypedDict, total=False):
     last_error: str
     # 收尾
     final_answer: str
+    # 意图路由（M8a Stage 6）
+    intent_route: str
+    intent_reason: str
+    intent_confidence: float
+    chat_response: str
+    # 会话上下文（M8b Stage 6，预留）
+    session_context: str

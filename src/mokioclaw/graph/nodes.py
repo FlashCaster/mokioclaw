@@ -31,6 +31,7 @@ from mokioclaw.graph.state import MokioGraphState
 from mokioclaw.prompts.stage2 import ACTOR_PROMPT, VERIFIER_PROMPT
 from mokioclaw.prompts.stage3 import PLANNER_PROMPT
 from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+from mokioclaw.prompts.stage6 import CHAT_RESPONDER_PROMPT, INTENT_ROUTER_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.registry import build_read_only_tools, build_tools
 from mokioclaw.tools.todo_tool import (
@@ -186,6 +187,62 @@ def _execute_planner_tool(working_state: dict, call: dict[str, Any]) -> ToolMess
 # --------------------------------------------------------------------------
 # 节点
 # --------------------------------------------------------------------------
+
+def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
+    """意图路由：判断输入是 chat（轻量应答）还是 workflow（复杂工作流）。
+
+    fail-safe：解析失败或 confidence < 0.55 时默认 workflow（宁可用重流程也不漏任务）。
+    """
+    route = "workflow"
+    reason = "router fallback: default to workflow"
+    confidence = 0.0
+    try:
+        response = create_model().invoke(
+            [
+                SystemMessage(content=INTENT_ROUTER_PROMPT),
+                HumanMessage(content=_router_input(state)),
+            ]
+        )
+        parsed = _extract_json(str(response.content)) or {}
+        candidate = str(parsed.get("route", "")).strip().lower()
+        parsed_confidence = _coerce_confidence(parsed.get("confidence"))
+        if candidate in {"chat", "workflow"} and parsed_confidence >= 0.55:
+            route = candidate
+            confidence = parsed_confidence
+            reason = str(parsed.get("reason") or "")
+        else:
+            reason = str(parsed.get("reason") or "router returned low-confidence or invalid route")
+            confidence = parsed_confidence
+    except Exception as exc:
+        reason = f"router error: {type(exc).__name__}: {exc}"
+
+    return {
+        "intent_route": route,
+        "intent_reason": reason,
+        "intent_confidence": confidence,
+    }
+
+
+def intent_route_fn(state: MokioGraphState) -> str:
+    return "chat_responder" if state.get("intent_route") == "chat" else "planner"
+
+
+def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
+    """轻量聊天应答：直接回复，不碰工具、不碰 workspace。"""
+    try:
+        response = create_model().invoke(
+            [
+                SystemMessage(content=CHAT_RESPONDER_PROMPT),
+                HumanMessage(content=_chat_input(state)),
+            ]
+        )
+        text = str(getattr(response, "content", "") or "").strip()
+    except Exception as exc:
+        text = f"这是轻量聊天分支，但模型回复暂不可用：{type(exc).__name__}: {exc}"
+    if not text:
+        text = "我在。你可以继续提问，或者直接描述一个需要我完成的任务。"
+    return {"chat_response": text, "final_answer": text}
+
 
 def planner_node(state: MokioGraphState) -> dict[str, Any]:
     working_state: MokioGraphState = {**state}
@@ -365,6 +422,20 @@ def final_node(state: MokioGraphState) -> dict[str, Any]:
 # 输入构造
 # --------------------------------------------------------------------------
 
+def _router_input(state: MokioGraphState) -> str:
+    parts = [f"User input:\n{state.get('task', '')}"]
+    if state.get("session_context"):
+        parts.append("Session context:\n" + str(state.get("session_context", "")))
+    return "\n\n".join(parts)
+
+
+def _chat_input(state: MokioGraphState) -> str:
+    parts = [f"User input:\n{state.get('task', '')}"]
+    if state.get("session_context"):
+        parts.append("Session context:\n" + str(state.get("session_context", "")))
+    return "\n\n".join(parts)
+
+
 def _planner_input(state: MokioGraphState) -> str:
     memory = build_layered_memory(state, node="planner")
     parts = [f"Task: {state['task']}", f"Attempt: {state.get('attempts', 0) + 1}"]
@@ -417,6 +488,14 @@ def _verifier_input(state: MokioGraphState) -> str:
 # --------------------------------------------------------------------------
 # 辅助
 # --------------------------------------------------------------------------
+
+def _coerce_confidence(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(parsed, 1.0))
+
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)

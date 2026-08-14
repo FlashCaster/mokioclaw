@@ -14,7 +14,7 @@ from mokioclaw.core.checkpoint import load_checkpoint, save_checkpoint
 from mokioclaw.core.paths import create_workspace
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.trace import TraceWriter
-from mokioclaw.graph.workflow import build_workflow
+from mokioclaw.graph.workflow import build_entry_workflow, build_workflow
 from mokioclaw.tools.registry import build_tools
 
 app = typer.Typer(
@@ -149,8 +149,35 @@ def callback(
 
     trace.record("run_start", task=initial["task"], checkpoint_mode=checkpoint_mode)
 
+    # 意图路由（Stage 6）：先判断 chat / workflow
+    entry_graph = build_entry_workflow()
+    entry_state: dict = dict(initial)
+    for step in entry_graph.stream(initial):
+        for node_name, data in step.items():
+            entry_state.update(data)
+            trace.record("node_start", node=node_name)
+            if node_name == "intent_router":
+                route = data.get("intent_route", "workflow")
+                console.print(
+                    f"[dim]🧭 路由:[/dim] [bold]{route}[/bold] "
+                    f"[dim](confidence {data.get('intent_confidence', 0):.2f})[/dim]\n"
+                )
+            elif node_name == "chat_responder":
+                console.print(
+                    Panel(
+                        data.get("chat_response", ""),
+                        title="[bold cyan]💬 MokioClaw[/bold cyan]",
+                        border_style="cyan",
+                    )
+                )
+            trace.record("node_end", node=node_name)
+
+    if entry_state.get("intent_route") == "chat":
+        trace.finalize(entry_state)
+        return
+
     graph = build_workflow()
-    merged_state: dict = dict(initial)
+    merged_state: dict = dict(entry_state)
 
     for step in graph.stream(initial):
         for node_name, data in step.items():
