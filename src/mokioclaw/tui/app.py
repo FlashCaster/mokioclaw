@@ -143,8 +143,8 @@ class MokioClawApp(App):
         )
         self._approval_in_progress = False
         self._running = False
-        self._cancel_event = threading.Event()
-        self._run_state = "空闲"  # 空闲 / 运行中 / 停止中 / 已停止 / 完成
+        self._run_generation = 0  # 任务世代号：递增用于「立即取消」判断 + 事件隔离
+        self._run_state = "空闲"  # 空闲 / 运行中 / 已停止 / 完成
         self._run_detail = ""
         self._last_status: dict[str, Any] | None = None
 
@@ -175,11 +175,12 @@ class MokioClawApp(App):
         if not self._running:
             self._write("[dim]没有正在运行的任务[/]")
             return
-        self._cancel_event.set()
-        self._run_state = "停止中"
-        self._run_detail = "等待当前步骤结束..."
+        self._running = False
+        self._run_generation += 1  # 作废旧任务 → 旧线程检测到世代号不匹配即退出
+        self._run_state = "已停止"
+        self._run_detail = ""
         self._refresh_status()
-        self._write("[yellow]⏹ 已请求停止，等待当前步骤结束...[/]")
+        self._write("[yellow]⏹ 任务已停止，可直接提交新任务[/]")
 
     # ------------------------------------------------------------------
     # 事件轮询（asyncio 侧）
@@ -200,6 +201,9 @@ class MokioClawApp(App):
             self._handle_event(event)
 
     def _handle_event(self, event: dict[str, Any]) -> None:
+        gen = event.get("gen")
+        if gen is not None and gen != self._run_generation:
+            return  # 旧任务事件，忽略
         etype = event.get("type", "")
         node = escape(str(event.get("node", "")))
 
@@ -233,12 +237,6 @@ class MokioClawApp(App):
         elif etype == "error":
             detail = escape(str(event.get("detail", ""))[:120])
             self._write(f"[red]⚠️ 错误[/] {detail}")
-        elif etype == "run_cancelled":
-            self._write("[yellow]⏹ 任务已停止[/]")
-            self._running = False
-            self._run_state = "已停止"
-            self._run_detail = ""
-            self._refresh_status()
         elif etype == "run_end":
             self._write("[bold green]✅ 运行结束[/]")
             self._running = False
@@ -315,15 +313,20 @@ class MokioClawApp(App):
             self._write("[yellow]⚠️ 已有任务在运行，按 Ctrl+X 停止后再提交[/]")
             return
         self._running = True
-        self._cancel_event.clear()
+        self._run_generation += 1
+        gen = self._run_generation
         self._run_state = "运行中"
         self._run_detail = "正在启动 agent..."
         self._refresh_status()
         self._write(f"[bold green]🚀 任务已提交：[/]{escape(task)}")
-        threading.Thread(target=self._run_agent, args=(task,), daemon=True).start()
+        threading.Thread(target=self._run_agent, args=(task, gen), daemon=True).start()
 
-    def _run_agent(self, task: str) -> None:
-        """agent 后台线程：跑图，节点/工具事件经 TraceWriter 自动入总线。"""
+    def _run_agent(self, task: str, gen: int) -> None:
+        """agent 后台线程：跑图，节点/工具事件经 TraceWriter 自动入总线。
+
+        gen 是任务世代号：若与 self._run_generation 不一致（已被取消/被新任务取代），
+        立即退出，实现「立即停止」。
+        """
         try:
             graph = build_workflow()
             initial: dict[str, Any] = {
@@ -333,14 +336,14 @@ class MokioClawApp(App):
                 "attempts": 0,
             }
             merged: dict[str, Any] = dict(initial)
-            self.trace.record("run_start", task=task, checkpoint_mode=self.state.checkpoint_mode)
+            self.trace.record("run_start", task=task, checkpoint_mode=self.state.checkpoint_mode, gen=gen)
 
             for step in graph.stream(initial):
-                if self._cancel_event.is_set():
+                if gen != self._run_generation:
                     break
                 for node_name, data in step.items():
                     merged.update(data)
-                    self.trace.record("node_start", node=node_name)
+                    self.trace.record("node_start", node=node_name, gen=gen)
                     ckpt = save_checkpoint(self.state, merged, node=node_name)
                     if ckpt.get("ok") and not ckpt.get("skipped"):
                         self.trace.record(
@@ -348,29 +351,30 @@ class MokioClawApp(App):
                             node=node_name,
                             id=ckpt.get("id"),
                             mode=ckpt.get("mode"),
+                            gen=gen,
                         )
-                    self._emit_status(merged, node_name)
-                    self.trace.record("node_end", node=node_name)
-                    if self._cancel_event.is_set():
+                    self._emit_status(merged, node_name, gen)
+                    self.trace.record("node_end", node=node_name, gen=gen)
+                    if gen != self._run_generation:
                         break
 
-            if self._cancel_event.is_set():
-                self.trace.record("run_cancelled", reason="用户中断")
+            if gen != self._run_generation:
+                self.trace.record("run_cancelled", reason="用户中断", gen=gen)
                 self.trace.finalize(merged)
-                self.bus.publish({"ts": _now(), "type": "run_cancelled", "reason": "用户中断"})
+                self.bus.publish({"ts": _now(), "type": "run_cancelled", "reason": "用户中断", "gen": gen})
                 return
 
             self.trace.finalize(merged)
             final = merged.get("final_answer", "")
             if final:
                 self.bus.publish(
-                    {"ts": _now(), "type": "run_end", "final_answer": final[:500]}
+                    {"ts": _now(), "type": "run_end", "final_answer": final[:500], "gen": gen}
                 )
         except Exception as exc:  # noqa: BLE001
-            self.trace.record("error", detail=f"{type(exc).__name__}: {exc}")
-            self.bus.publish({"ts": _now(), "type": "run_end", "final_answer": ""})
+            self.trace.record("error", detail=f"{type(exc).__name__}: {exc}", gen=gen)
+            self.bus.publish({"ts": _now(), "type": "run_end", "final_answer": "", "gen": gen})
 
-    def _emit_status(self, merged: dict[str, Any], node_name: str) -> None:
+    def _emit_status(self, merged: dict[str, Any], node_name: str, gen: int) -> None:
         memory = build_layered_memory(merged, node=node_name)
         todos = merged.get("todos", []) or []
         done = sum(1 for t in todos if t.get("status") == "completed")
@@ -378,6 +382,7 @@ class MokioClawApp(App):
             {
                 "ts": _now(),
                 "type": "status",
+                "gen": gen,
                 "node": node_name,
                 "task": merged.get("task", ""),
                 "todo_done": done,
