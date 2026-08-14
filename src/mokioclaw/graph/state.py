@@ -23,6 +23,20 @@ class VerificationCheck(TypedDict, total=False):
     detail: str
 
 
+class SourceItem(TypedDict, total=False):
+    title: str
+    url: str
+    content: str
+    score: float
+
+
+class AgentHandoff(TypedDict, total=False):
+    from_agent: str
+    to_agent: str
+    instruction: str
+    result: str
+
+
 class MokioGraphState(TypedDict, total=False):
     # 输入
     task: str
@@ -41,6 +55,11 @@ class MokioGraphState(TypedDict, total=False):
     verifier_summary: str
     verification_checks: list[VerificationCheck]
     recommended_next_instruction: str
+    # 多智能体（M6）
+    research_notes: str
+    sources: list[SourceItem]
+    agent_handoffs: list[AgentHandoff]
+    code_agent_summary: str
     # 记忆 / 上下文压缩（M5）
     context_summary: str
     context_token_count: int

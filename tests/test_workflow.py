@@ -53,4 +53,4 @@ def test_normalize_checks_non_list():
 def test_build_workflow_nodes():
     graph = build_workflow()
     nodes = set(graph.get_graph().nodes)
-    assert {"planner", "actor", "verifier", "final"} <= nodes
+    assert {"planner", "verifier", "final", "context_monitor", "context_compressor"} <= nodes

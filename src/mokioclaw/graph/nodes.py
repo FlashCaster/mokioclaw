@@ -25,8 +25,11 @@ from mokioclaw.graph.memory import (
     format_layered_memory_for_prompt,
     persist_history_summary,
 )
+from mokioclaw.agents.code_agent import run_code_agent
+from mokioclaw.agents.search_agent import run_search_agent
 from mokioclaw.graph.state import MokioGraphState
-from mokioclaw.prompts.stage2 import ACTOR_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
+from mokioclaw.prompts.stage2 import ACTOR_PROMPT, VERIFIER_PROMPT
+from mokioclaw.prompts.stage3 import PLANNER_PROMPT
 from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.registry import build_read_only_tools, build_tools
@@ -93,14 +96,91 @@ def _todo_update_tool(working_state: dict) -> StructuredTool:
     )
 
 
+def _build_planner_tools(working_state: dict) -> list[StructuredTool]:
+    """Supervisor 的工具：TodoWrite + 委派 searchAgent/codeAgent。"""
+    return [
+        _todo_write_tool(working_state),
+        StructuredTool.from_function(
+            name="CallSearchAgentTool",
+            func=lambda instruction: _call_search_agent_tool(working_state, instruction),
+            description="Delegate web research to searchAgent. Args: instruction.",
+        ),
+        StructuredTool.from_function(
+            name="CallCodeAgentTool",
+            func=lambda instruction: _call_code_agent_tool(working_state, instruction),
+            description="Delegate implementation work to codeAgent. Args: instruction.",
+        ),
+    ]
+
+
+def _call_search_agent_tool(working_state: dict, instruction: str) -> dict[str, Any]:
+    result = run_search_agent(working_state, instruction)
+    existing_sources = list(working_state.get("sources", []))
+    working_state["research_notes"] = _join_notes(
+        working_state.get("research_notes", ""), result.get("summary", "")
+    )
+    working_state["sources"] = _dedupe_sources(
+        existing_sources + list(result.get("sources", []))
+    )
+    handoff = {
+        "from_agent": "planner",
+        "to_agent": "searchAgent",
+        "instruction": instruction,
+        "result": result.get("summary", ""),
+    }
+    working_state["agent_handoffs"] = list(working_state.get("agent_handoffs", [])) + [handoff]
+    return {
+        "ok": True,
+        "summary": result.get("summary", ""),
+        "sources": working_state.get("sources", []),
+        "queries": result.get("queries", []),
+    }
+
+
+def _call_code_agent_tool(working_state: dict, instruction: str) -> dict[str, Any]:
+    result = run_code_agent(working_state, instruction)
+    working_state["todos"] = result.get("todos", working_state.get("todos", []))
+    working_state["code_agent_summary"] = result.get("summary", "")
+    handoff = {
+        "from_agent": "planner",
+        "to_agent": "codeAgent",
+        "instruction": instruction,
+        "result": result.get("summary", ""),
+    }
+    working_state["agent_handoffs"] = list(working_state.get("agent_handoffs", [])) + [handoff]
+    return {
+        "ok": True,
+        "summary": result.get("summary", ""),
+        "todos": working_state.get("todos", []),
+    }
+
+
+def _execute_planner_tool(working_state: dict, call: dict[str, Any]) -> ToolMessage:
+    name = call.get("name", "")
+    args = call.get("args") or {}
+    tools = {tool.name: tool for tool in _build_planner_tools(working_state)}
+    tool = tools.get(name)
+    if tool is None:
+        result = {"ok": False, "error": f"unknown tool: {name}"}
+    else:
+        try:
+            result = tool.invoke(args)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return ToolMessage(
+        content=json.dumps(result, ensure_ascii=False, default=str),
+        name=name,
+        tool_call_id=call.get("id") or f"{name}-call",
+    )
+
+
 # --------------------------------------------------------------------------
 # 节点
 # --------------------------------------------------------------------------
 
 def planner_node(state: MokioGraphState) -> dict[str, Any]:
     working_state: MokioGraphState = {**state}
-    write_tool = _todo_write_tool(working_state)
-    planner = create_model().bind_tools([write_tool])
+    planner = create_model().bind_tools(_build_planner_tools(working_state))
 
     messages: list[Any] = [
         SystemMessage(content=PLANNER_PROMPT),
@@ -116,23 +196,19 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
         if not tool_calls:
             break
         for tc in tool_calls:
-            try:
-                result = write_tool.invoke(tc.get("args", {}))
-            except Exception as exc:
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            produced.append(
-                ToolMessage(
-                    content=json.dumps(result, ensure_ascii=False, default=str),
-                    tool_call_id=tc["id"],
-                )
-            )
-            messages.append(produced[-1])
+            tool_message = _execute_planner_tool(working_state, tc)
+            produced.append(tool_message)
+            messages.append(tool_message)
 
     return {
         "plan_summary": working_state.get("plan_summary", ""),
         "todos": working_state.get("todos", []),
         "acceptance_criteria": working_state.get("acceptance_criteria", []),
         "verification_commands": working_state.get("verification_commands", []),
+        "research_notes": working_state.get("research_notes", ""),
+        "sources": working_state.get("sources", []),
+        "agent_handoffs": working_state.get("agent_handoffs", []),
+        "code_agent_summary": working_state.get("code_agent_summary", ""),
         "messages": produced,
     }
 
@@ -552,3 +628,23 @@ def _short_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _join_notes(existing: str, new: str) -> str:
+    if not existing:
+        return new
+    if not new:
+        return existing
+    return existing + "\n\n" + new
+
+
+def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped = []
+    for source in sources:
+        url = str(source.get("url", ""))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(source)
+    return deduped
