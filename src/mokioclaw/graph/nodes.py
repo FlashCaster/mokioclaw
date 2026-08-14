@@ -11,14 +11,23 @@ The verifier uses read-only tools only, so "checking" cannot secretly "fix".
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from mokioclaw.graph.memory import (
+    build_layered_memory,
+    format_layered_memory_for_prompt,
+    persist_history_summary,
+)
 from mokioclaw.graph.state import MokioGraphState
 from mokioclaw.prompts.stage2 import ACTOR_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
+from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.registry import build_read_only_tools, build_tools
 from mokioclaw.tools.todo_tool import (
@@ -224,6 +233,7 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
         "verification_checks": _normalize_checks(parsed.get("checks")),
         "recommended_next_instruction": str(parsed.get("recommended_next_instruction") or ""),
         "messages": produced,
+        "context_next_node": verifier_route({**state, "passed": passed, "attempts": attempts}),
     }
 
 
@@ -259,18 +269,21 @@ def final_node(state: MokioGraphState) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 def _planner_input(state: MokioGraphState) -> str:
+    memory = build_layered_memory(state, node="planner")
     parts = [f"Task: {state['task']}", f"Attempt: {state.get('attempts', 0) + 1}"]
     if state.get("attempts", 0) > 0 and state.get("recommended_next_instruction"):
         parts.append(
             "Previous verifier failed. Revise the plan to fix only this:\n"
             + state["recommended_next_instruction"]
         )
+    parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
     return "\n\n".join(parts)
 
 
 def _actor_input(state: MokioGraphState) -> str:
+    memory = build_layered_memory(state, node="actor")
     if not state.get("todos"):
-        return state["task"]
+        return state["task"] + "\n\nLayered memory snapshot:\n" + format_layered_memory_for_prompt(memory)
     todo_lines = "\n".join(
         f"- {t['id']} [{t.get('status', 'pending')}] {t['content']}" for t in state["todos"]
     )
@@ -282,11 +295,13 @@ def _actor_input(state: MokioGraphState) -> str:
         f"Todos:\n{todo_lines}\n\n"
         f"Acceptance criteria:\n{criteria_lines}\n\n"
         f"Verification commands:\n{command_lines}\n\n"
-        "Execute the plan. Update todo progress as you go."
+        "Execute the plan. Update todo progress as you go.\n\n"
+        "Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory)
     )
 
 
 def _verifier_input(state: MokioGraphState) -> str:
+    memory = build_layered_memory(state, node="verifier")
     parts = [f"Task: {state['task']}"]
     todo_lines = "\n".join(f"- {t['id']} {t['content']}" for t in state.get("todos", []))
     if todo_lines:
@@ -297,6 +312,7 @@ def _verifier_input(state: MokioGraphState) -> str:
     command_lines = "\n".join(f"- {c}" for c in state.get("verification_commands", []))
     if command_lines:
         parts.append(f"Verification commands:\n{command_lines}")
+    parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
     parts.append("Inspect the workspace with read-only tools and return only verifier JSON.")
     return "\n\n".join(parts)
 
@@ -343,3 +359,196 @@ def _last_ai_content(messages: list[Any]) -> str:
         if content:
             return str(content)
     return ""
+
+
+# --------------------------------------------------------------------------
+# Context Monitor / Compressor（M5）
+# --------------------------------------------------------------------------
+
+DEFAULT_CONTEXT_TOKEN_LIMIT = 400000
+
+
+def get_context_token_limit() -> int:
+    load_dotenv()
+    raw = os.getenv("MOKIO_CONTEXT_TOKEN_LIMIT", str(DEFAULT_CONTEXT_TOKEN_LIMIT))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_TOKEN_LIMIT
+    return value if value > 0 else DEFAULT_CONTEXT_TOKEN_LIMIT
+
+
+def estimate_context_tokens(state: MokioGraphState) -> int:
+    messages = list(state.get("messages", []))
+    payload = build_layered_memory(state, node="context_monitor")
+    payload_message = HumanMessage(content=json.dumps(payload, ensure_ascii=False, default=str))
+    try:
+        model = create_model()
+        return int(model.get_num_tokens_from_messages(messages + [payload_message]))
+    except Exception:
+        text = "\n".join(_message_text(message) for message in messages)
+        text += "\n" + str(payload_message.content)
+        return max(1, len(text) // 4)
+
+
+def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
+    token_limit = get_context_token_limit()
+    token_count = estimate_context_tokens(state)
+    should_compress = token_count >= token_limit
+    next_node = state.get("context_next_node") or "verifier"
+    return {
+        "context_token_count": token_count,
+        "context_token_limit": token_limit,
+        "context_should_compress": should_compress,
+        "context_next_node": next_node,
+    }
+
+
+def context_monitor_route(state: MokioGraphState) -> str:
+    if state.get("context_should_compress"):
+        return "context_compressor"
+    return state.get("context_next_node") or "verifier"
+
+
+def context_compressor_node(state: MokioGraphState) -> dict[str, Any]:
+    before_tokens = state.get("context_token_count") or estimate_context_tokens(state)
+    before_messages = list(state.get("messages", []))
+    memory = build_layered_memory(state, node="context_compressor")
+    compressed = _compress_context_with_model(state)
+    summary = _format_compressed_context(compressed, state)
+    summary_message = AIMessage(content=summary)
+    persist_history_summary(state["runtime"], summary)
+
+    post_state: MokioGraphState = {
+        **state,
+        "messages": [summary_message],
+        "context_summary": summary,
+        "history_summary": summary,
+        "memory_snapshot": build_layered_memory(
+            {**state, "context_summary": summary, "history_summary": summary},
+            node="context_compressor",
+        ),
+    }
+    after_tokens = estimate_context_tokens(post_state)
+    compression_event = {
+        "before_tokens": int(before_tokens),
+        "after_tokens": int(after_tokens),
+        "removed_messages": len(before_messages),
+        "summary": _short_text(summary, 1200),
+        "next_node": state.get("context_next_node", "verifier"),
+    }
+    events = list(state.get("compression_events", [])) + [compression_event]
+
+    return {
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), summary_message],
+        "context_summary": summary,
+        "context_token_count": after_tokens,
+        "context_should_compress": False,
+        "history_summary": summary,
+        "memory_snapshot": post_state.get("memory_snapshot", {}),
+        "compression_events": events,
+    }
+
+
+def context_compressor_route(state: MokioGraphState) -> str:
+    return state.get("context_next_node") or "verifier"
+
+
+def _compress_context_with_model(state: MokioGraphState) -> dict[str, Any]:
+    memory = build_layered_memory(state, node="context_compressor")
+    payload = {
+        "context_summary": state.get("context_summary", ""),
+        "memory": memory,
+        "messages": [_message_snapshot(message) for message in state.get("messages", [])],
+    }
+    messages = [
+        SystemMessage(content=CONTEXT_COMPRESSION_PROMPT),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False, default=str)),
+    ]
+    try:
+        response = create_model().invoke(messages)
+        parsed = _extract_json(str(response.content))
+        if parsed:
+            return parsed
+    except Exception as exc:
+        return _fallback_compression(state, error=f"{type(exc).__name__}: {exc}")
+    return _fallback_compression(state, error="compressor model did not return valid JSON")
+
+
+def _fallback_compression(state: MokioGraphState, *, error: str = "") -> dict[str, Any]:
+    return {
+        "summary": _short_text(
+            "\n\n".join(
+                [
+                    state.get("context_summary", ""),
+                    state.get("verifier_summary", ""),
+                    state.get("last_error", ""),
+                ]
+            ),
+            2400,
+        ),
+        "active_goal": state.get("task", ""),
+        "completed_work": state.get("verifier_summary", ""),
+        "open_todos": [
+            todo.get("content", "")
+            for todo in state.get("todos", [])
+            if todo.get("status") != "completed"
+        ],
+        "important_files": _important_files_from_state(state),
+        "tool_findings": _short_text(state.get("last_error", ""), 1200),
+        "sources": [],
+        "next_steps": state.get("context_next_node", ""),
+        "risks": error,
+    }
+
+
+def _format_compressed_context(compressed: dict[str, Any], state: MokioGraphState) -> str:
+    payload = {
+        "type": "mokio_context_summary",
+        "task": state.get("task", ""),
+        "plan_summary": state.get("plan_summary", ""),
+        "todos": state.get("todos", []),
+        "acceptance_criteria": state.get("acceptance_criteria", []),
+        "verification_commands": state.get("verification_commands", []),
+        "attempts": state.get("attempts", 0),
+        "passed": state.get("passed"),
+        "compression": compressed,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def _message_snapshot(message: Any) -> dict[str, str]:
+    return {
+        "type": type(message).__name__,
+        "name": str(getattr(message, "name", "") or ""),
+        "content": _short_text(_message_text(message), 2000),
+    }
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _important_files_from_state(state: MokioGraphState) -> list[str]:
+    files: list[str] = []
+    for command in state.get("verification_commands", []):
+        files.extend(re.findall(r"[\w./\\-]+\.(?:py|html|css|js|json|md|txt)", command))
+    for text in [state.get("verifier_summary", ""), state.get("last_error", "")]:
+        files.extend(re.findall(r"[\w./\\-]+\.(?:py|html|css|js|json|md|txt)", text))
+    seen: set[str] = set()
+    deduped = []
+    for item in files:
+        normalized = item.strip("'\"")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+    return deduped
+
+
+def _short_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."

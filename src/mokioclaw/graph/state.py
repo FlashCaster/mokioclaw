@@ -41,5 +41,15 @@ class MokioGraphState(TypedDict, total=False):
     verifier_summary: str
     verification_checks: list[VerificationCheck]
     recommended_next_instruction: str
+    # 记忆 / 上下文压缩（M5）
+    context_summary: str
+    context_token_count: int
+    context_token_limit: int
+    context_should_compress: bool
+    context_next_node: str
+    compression_events: list[dict]
+    history_summary: str
+    memory_snapshot: dict
+    last_error: str
     # 收尾
     final_answer: str

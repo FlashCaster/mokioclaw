@@ -6,6 +6,7 @@ from mokioclaw.core.state import RuntimeState
 from mokioclaw.tools.bash_tool import run_bash
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.grep_tool import grep
+from mokioclaw.tools.notepad_tool import append_notepad, read_notepad
 
 
 def build_tools(state: RuntimeState) -> list[StructuredTool]:
@@ -68,6 +69,22 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
             func=lambda command, timeout_seconds=120: run_bash(
                 state, command, timeout_seconds
             ),
+        ),
+        StructuredTool.from_function(
+            name="NotepadReadTool",
+            description=(
+                "Read the durable workspace notepad (NOTEPAD.md). "
+                "Use to recover prior notes after context compression."
+            ),
+            func=lambda: read_notepad(state),
+        ),
+        StructuredTool.from_function(
+            name="NotepadAppendTool",
+            description=(
+                "Append a durable note to NOTEPAD.md. Args: heading, content. "
+                "Use for key findings, decisions, and blockers that must survive compression."
+            ),
+            func=lambda heading, content: append_notepad(state, heading, content),
         ),
     ]
 
