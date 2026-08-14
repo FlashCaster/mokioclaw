@@ -80,3 +80,14 @@ class ApprovalBridge:
             return self.requests.get_nowait()
         except queue.Empty:
             return None
+
+    def cancel_all(self) -> None:
+        """TUI 线程调用：拒绝所有 pending 审批请求（停止任务时清理，避免旧线程阻塞）。"""
+        with self._lock:
+            items = list(self._pending.items())
+            self._pending.clear()
+        for _command, result_q in items:
+            try:
+                result_q.put_nowait(False)
+            except queue.Full:
+                pass

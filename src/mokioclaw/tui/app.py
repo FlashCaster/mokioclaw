@@ -16,6 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
+from textual import work
 
 from rich.markup import escape
 
@@ -42,13 +43,14 @@ _NODE_LABEL = {
 }
 
 
-class ApprovalModal(ModalScreen[bool]):
-    """审批弹窗：高危命令等待用户批准 / 拒绝。"""
+class ApprovalModal(ModalScreen[str]):
+    """审批弹窗：高危命令等待用户批准 / 拒绝 / 停止任务。"""
 
     BINDINGS = [
         ("y", "approve", "批准"),
         ("n", "deny", "拒绝"),
         ("escape", "deny", "拒绝"),
+        ("ctrl+x", "cancel", "停止任务"),
     ]
 
     def __init__(self, command: str) -> None:
@@ -59,22 +61,28 @@ class ApprovalModal(ModalScreen[bool]):
         with Vertical(id="approval-box"):
             yield Label("[b]⚠️ 高危命令，批准执行？[/b]", id="approval-title")
             yield Static(self.command, id="approval-command")
-            yield Label("[dim]按 y 批准 / n 拒绝（默认拒绝）[/dim]")
+            yield Label("[dim]按 y 批准 / n 拒绝（默认拒绝）/ ctrl+x 停止任务[/dim]")
             with Horizontal(id="approval-buttons"):
                 yield Button("批准 (y)", variant="warning", id="approve")
                 yield Button("拒绝 (n)", variant="error", id="deny")
+                yield Button("停止任务 (ctrl+x)", variant="primary", id="cancel")
 
     def action_approve(self) -> None:
-        self.dismiss(True)
+        self.dismiss("approve")
 
     def action_deny(self) -> None:
-        self.dismiss(False)
+        self.dismiss("deny")
+
+    def action_cancel(self) -> None:
+        self.dismiss("cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "approve":
-            self.dismiss(True)
+            self.dismiss("approve")
         elif event.button.id == "deny":
-            self.dismiss(False)
+            self.dismiss("deny")
+        elif event.button.id == "cancel":
+            self.dismiss("cancel")
 
 
 class MokioClawApp(App):
@@ -177,6 +185,7 @@ class MokioClawApp(App):
             return
         self._running = False
         self._run_generation += 1  # 作废旧任务 → 旧线程检测到世代号不匹配即退出
+        self.bridge.cancel_all()  # 清理残留审批请求，让旧线程立即返回
         self._run_state = "已停止"
         self._run_detail = ""
         self._refresh_status()
@@ -187,18 +196,30 @@ class MokioClawApp(App):
     # ------------------------------------------------------------------
 
     async def _poll(self) -> None:
-        # 1) 审批请求：弹 Modal 阻塞等待用户决定，回传 ApprovalBridge
+        # 1) 审批请求：启动 worker 弹 Modal（不阻塞 set_interval）
         command = self.bridge.poll_request()
         if command and not self._approval_in_progress:
             self._approval_in_progress = True
-            approved = await self.push_screen_wait(ApprovalModal(command))
-            self.bridge.resolve(command, bool(approved))
-            self._approval_in_progress = False
-            self._write(f"[bold yellow]审批[/] {'批准' if approved else '拒绝'}：{escape(command[:60])}")
+            self._handle_approval(command)
 
         # 2) 事件：更新时间线 / 状态 / 记忆面板
         for event in self.bus.drain():
             self._handle_event(event)
+
+    @work(exclusive=True)
+    async def _handle_approval(self, command: str) -> None:
+        """审批 worker：push_screen_wait 必须在 worker 里运行。"""
+        try:
+            result = await self.push_screen_wait(ApprovalModal(command))
+            if result == "cancel":
+                # 用户在审批弹窗里按 ctrl+x → 停止整个任务
+                self._cancel()
+                return
+            approved = result == "approve"
+            self.bridge.resolve(command, approved)
+            self._write(f"[bold yellow]审批[/] {'批准' if approved else '拒绝'}：{escape(command[:60])}")
+        finally:
+            self._approval_in_progress = False
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         gen = event.get("gen")

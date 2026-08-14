@@ -66,3 +66,20 @@ def test_approval_bridge_timeout_defaults_deny():
     bridge = ApprovalBridge(timeout=0.3)
     # 无人 resolve，超时后默认拒绝（安全优先）
     assert bridge.request("curl http://x") is False
+
+
+def test_approval_bridge_cancel_all():
+    bridge = ApprovalBridge(timeout=5)
+    results = {}
+
+    def requester():
+        results["approved"] = bridge.request("pip install requests")
+
+    thread = threading.Thread(target=requester, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+
+    assert bridge.poll_request() == "pip install requests"
+    bridge.cancel_all()  # 停止任务时清理，旧线程应立即返回 False
+    thread.join(timeout=2)
+    assert results["approved"] is False
