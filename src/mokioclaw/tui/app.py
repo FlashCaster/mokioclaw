@@ -31,6 +31,17 @@ def _now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+# 节点 → 人类可读的「正在做什么」描述（任务流程透明）
+_NODE_LABEL = {
+    "planner": "规划中 · 拆解任务/委派",
+    "actor": "执行中 · 写代码/跑命令",
+    "verifier": "验证中 · 检查结果",
+    "context_monitor": "检查上下文窗口",
+    "context_compressor": "压缩上下文中",
+    "final": "生成最终答案",
+}
+
+
 class ApprovalModal(ModalScreen[bool]):
     """审批弹窗：高危命令等待用户批准 / 拒绝。"""
 
@@ -71,6 +82,9 @@ class MokioClawApp(App):
 
     TITLE = "MokioClaw"
     SUB_TITLE = "planner → verifier multi-agent"
+    BINDINGS = [
+        ("ctrl+x", "cancel_task", "停止任务"),
+    ]
     CSS = """
     #timeline {
         height: 1fr;
@@ -98,6 +112,15 @@ class MokioClawApp(App):
         margin: 1 0;
         color: $text-warning;
     }
+    #input-row {
+        height: 3;
+    }
+    #input-row Input {
+        width: 1fr;
+    }
+    #stop-button {
+        width: 12;
+    }
     """
 
     def __init__(
@@ -120,13 +143,19 @@ class MokioClawApp(App):
         )
         self._approval_in_progress = False
         self._running = False
+        self._cancel_event = threading.Event()
+        self._run_state = "空闲"  # 空闲 / 运行中 / 停止中 / 已停止 / 完成
+        self._run_detail = ""
+        self._last_status: dict[str, Any] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
             with Vertical(id="left"):
                 yield RichLog(id="timeline", highlight=True, markup=True, wrap=True)
-                yield Input(placeholder="输入任务，回车执行（如：帮我创建一个贪吃蛇游戏）")
+                with Horizontal(id="input-row"):
+                    yield Input(placeholder="输入任务，回车执行（如：帮我创建一个贪吃蛇游戏）")
+                    yield Button("⏹ 停止", id="stop-button", variant="error")
             with Vertical(id="right"):
                 yield Static("等待任务…", id="status-panel")
                 yield Static("Memory Snapshot 暂无", id="memory-panel")
@@ -134,6 +163,23 @@ class MokioClawApp(App):
 
     def on_mount(self) -> None:
         self.set_interval(0.15, self._poll)
+
+    def action_cancel_task(self) -> None:
+        self._cancel()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "stop-button":
+            self._cancel()
+
+    def _cancel(self) -> None:
+        if not self._running:
+            self._write("[dim]没有正在运行的任务[/]")
+            return
+        self._cancel_event.set()
+        self._run_state = "停止中"
+        self._run_detail = "等待当前步骤结束..."
+        self._refresh_status()
+        self._write("[yellow]⏹ 已请求停止，等待当前步骤结束...[/]")
 
     # ------------------------------------------------------------------
     # 事件轮询（asyncio 侧）
@@ -158,7 +204,10 @@ class MokioClawApp(App):
         node = escape(str(event.get("node", "")))
 
         if etype == "node_start":
-            self._write(f"[cyan]▶ 进入节点[/] [bold]{node}[/]")
+            label = _NODE_LABEL.get(event.get("node", ""), "")
+            self._run_detail = label or f"节点 {node}"
+            self._refresh_status()
+            self._write(f"[cyan]▶ {node}[/] [dim]{label}[/]")
         elif etype == "node_end":
             self._write(f"[cyan]◀ 离开节点[/] [bold]{node}[/]")
         elif etype == "tool_call":
@@ -184,9 +233,18 @@ class MokioClawApp(App):
         elif etype == "error":
             detail = escape(str(event.get("detail", ""))[:120])
             self._write(f"[red]⚠️ 错误[/] {detail}")
+        elif etype == "run_cancelled":
+            self._write("[yellow]⏹ 任务已停止[/]")
+            self._running = False
+            self._run_state = "已停止"
+            self._run_detail = ""
+            self._refresh_status()
         elif etype == "run_end":
             self._write("[bold green]✅ 运行结束[/]")
             self._running = False
+            self._run_state = "完成"
+            self._run_detail = ""
+            self._refresh_status()
         elif etype == "status":
             self._update_status(event)
             self._update_memory(event)
@@ -196,19 +254,36 @@ class MokioClawApp(App):
         timeline.write(text)
 
     def _update_status(self, event: dict[str, Any]) -> None:
+        self._last_status = event
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
         status = self.query_one("#status-panel", Static)
-        passed = event.get("passed")
-        passed_text = "✅ 通过" if passed is True else ("❌ 失败" if passed is False else "—")
+        event = self._last_status or {}
+        run_icon = {
+            "空闲": "⚪",
+            "运行中": "🟢",
+            "停止中": "🟡",
+            "已停止": "⏹",
+            "完成": "✅",
+        }.get(self._run_state, "⚪")
         lines = [
             "[b]状态面板[/b]",
-            f"节点：{escape(str(event.get('node', '')))}",
-            f"任务：{escape(str(event.get('task', ''))[:40])}",
-            f"Todos：{event.get('todo_done', 0)}/{event.get('todo_total', 0)} 完成",
-            f"尝试：{event.get('attempts', 0)}",
-            f"验证：{passed_text}",
-            f"Handoffs：{event.get('handoffs', 0)}",
-            f"Sources：{event.get('sources', 0)}",
+            f"运行：{run_icon} [b]{self._run_state}[/b]",
         ]
+        if self._run_detail:
+            lines.append(f"当前：{escape(self._run_detail)}")
+        if event:
+            passed = event.get("passed")
+            passed_text = "✅ 通过" if passed is True else ("❌ 失败" if passed is False else "—")
+            lines += [
+                f"任务：{escape(str(event.get('task', ''))[:40])}",
+                f"Todos：{event.get('todo_done', 0)}/{event.get('todo_total', 0)} 完成",
+                f"尝试：{event.get('attempts', 0)}",
+                f"验证：{passed_text}",
+                f"Handoffs：{event.get('handoffs', 0)}",
+                f"Sources：{event.get('sources', 0)}",
+            ]
         status.update("\n".join(lines))
 
     def _update_memory(self, event: dict[str, Any]) -> None:
@@ -237,10 +312,14 @@ class MokioClawApp(App):
         if not task:
             return
         if self._running:
-            self._write("[yellow]⚠️ 已有任务在运行，请等待完成[/]")
+            self._write("[yellow]⚠️ 已有任务在运行，按 Ctrl+X 停止后再提交[/]")
             return
         self._running = True
-        self._write(f"[bold]任务：[/]{escape(task)}")
+        self._cancel_event.clear()
+        self._run_state = "运行中"
+        self._run_detail = "正在启动 agent..."
+        self._refresh_status()
+        self._write(f"[bold green]🚀 任务已提交：[/]{escape(task)}")
         threading.Thread(target=self._run_agent, args=(task,), daemon=True).start()
 
     def _run_agent(self, task: str) -> None:
@@ -257,6 +336,8 @@ class MokioClawApp(App):
             self.trace.record("run_start", task=task, checkpoint_mode=self.state.checkpoint_mode)
 
             for step in graph.stream(initial):
+                if self._cancel_event.is_set():
+                    break
                 for node_name, data in step.items():
                     merged.update(data)
                     self.trace.record("node_start", node=node_name)
@@ -270,6 +351,14 @@ class MokioClawApp(App):
                         )
                     self._emit_status(merged, node_name)
                     self.trace.record("node_end", node=node_name)
+                    if self._cancel_event.is_set():
+                        break
+
+            if self._cancel_event.is_set():
+                self.trace.record("run_cancelled", reason="用户中断")
+                self.trace.finalize(merged)
+                self.bus.publish({"ts": _now(), "type": "run_cancelled", "reason": "用户中断"})
+                return
 
             self.trace.finalize(merged)
             final = merged.get("final_answer", "")

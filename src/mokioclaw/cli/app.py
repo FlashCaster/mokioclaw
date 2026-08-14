@@ -19,7 +19,7 @@ from mokioclaw.tools.registry import build_tools
 
 app = typer.Typer(
     name="mokioclaw",
-    help="MokioClaw Stage 2 — planner→actor→verifier CodeAgent",
+    help="MokioClaw — planner→verifier multi-agent CodeAgent",
     invoke_without_command=True,
 )
 console = Console()
@@ -71,7 +71,10 @@ def _render_messages(messages) -> None:
 
 @app.callback()
 def callback(
-    task: Optional[str] = typer.Argument(None, help="Task description for the agent"),
+    ctx: typer.Context,
+    task: Optional[str] = typer.Option(
+        None, "--task", "-t", help="Task description for the agent (or use a subcommand: tui / list-tools)"
+    ),
     workspace: Optional[Path] = typer.Option(
         None, "-w", "--workspace", help="Workspace directory (auto-created if not provided)"
     ),
@@ -86,8 +89,11 @@ def callback(
     ),
 ) -> None:
     """Run the MokioClaw planner→actor→verifier agent on a task."""
+    # 有子命令（tui / list-tools）时，跳过 agent 逻辑，直接交给子命令执行
+    if ctx.invoked_subcommand is not None:
+        return
     if task is None and not resume:
-        app.get_command(None)
+        typer.echo(ctx.get_help())
         raise typer.Exit()
 
     # 解析 workspace：resume 时优先用最近一次 workspace
