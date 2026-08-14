@@ -17,6 +17,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
+from rich.markup import escape
+
 from mokioclaw.core.checkpoint import save_checkpoint
 from mokioclaw.core.events import ApprovalBridge, EventBus
 from mokioclaw.core.state import RuntimeState
@@ -123,7 +125,7 @@ class MokioClawApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id="left"):
-                yield RichLog(id="timeline", highlight=True, markup=False, wrap=True)
+                yield RichLog(id="timeline", highlight=True, markup=True, wrap=True)
                 yield Input(placeholder="输入任务，回车执行（如：帮我创建一个贪吃蛇游戏）")
             with Vertical(id="right"):
                 yield Static("等待任务…", id="status-panel")
@@ -145,38 +147,45 @@ class MokioClawApp(App):
             approved = await self.push_screen_wait(ApprovalModal(command))
             self.bridge.resolve(command, bool(approved))
             self._approval_in_progress = False
-            self._write(f"[bold yellow]审批[/] {'批准' if approved else '拒绝'}：{command[:60]}")
+            self._write(f"[bold yellow]审批[/] {'批准' if approved else '拒绝'}：{escape(command[:60])}")
 
         # 2) 事件：更新时间线 / 状态 / 记忆面板
         for event in self.bus.drain():
             self._handle_event(event)
 
     def _handle_event(self, event: dict[str, Any]) -> None:
-        ts = event.get("ts", "")
         etype = event.get("type", "")
-        node = event.get("node", "")
+        node = escape(str(event.get("node", "")))
 
         if etype == "node_start":
             self._write(f"[cyan]▶ 进入节点[/] [bold]{node}[/]")
         elif etype == "node_end":
             self._write(f"[cyan]◀ 离开节点[/] [bold]{node}[/]")
         elif etype == "tool_call":
-            self._write(f"[green]🔧 {event.get('tool', '')}[/] {event.get('args', '')[:80]}")
+            tool = escape(str(event.get("tool", "")))
+            args = escape(str(event.get("args", ""))[:80])
+            self._write(f"[green]🔧 {tool}[/] {args}")
         elif etype == "tool_result":
             mark = "✅" if event.get("ok") else "❌"
-            self._write(f"   {mark} {event.get('tool', '')} {event.get('detail', '')[:60]}")
+            tool = escape(str(event.get("tool", "")))
+            detail = escape(str(event.get("detail", ""))[:60])
+            self._write(f"   {mark} {tool} {detail}")
         elif etype == "handoff":
-            self._write(
-                f"[magenta]🔀 handoff[/] {event.get('from_agent', '')} → {event.get('to_agent', '')}"
-            )
+            frm = escape(str(event.get("from_agent", "")))
+            to = escape(str(event.get("to_agent", "")))
+            self._write(f"[magenta]🔀 handoff[/] {frm} → {to}")
         elif etype == "checkpoint":
-            self._write(f"[blue]💾 检查点 {event.get('id', '')}[/]（{event.get('mode', '')}）")
+            cid = escape(str(event.get("id", "")))
+            mode = escape(str(event.get("mode", "")))
+            self._write(f"[blue]💾 检查点 {cid}[/]（{mode}）")
         elif etype == "compression":
-            self._write(f"[yellow]🗜️ 上下文压缩[/] {event.get('detail', '')[:60]}")
+            detail = escape(str(event.get("detail", ""))[:60])
+            self._write(f"[yellow]🗜️ 上下文压缩[/] {detail}")
         elif etype == "error":
-            self._write(f"[red]⚠️ 错误[/] {event.get('detail', '')[:120]}")
+            detail = escape(str(event.get("detail", ""))[:120])
+            self._write(f"[red]⚠️ 错误[/] {detail}")
         elif etype == "run_end":
-            self._write(f"[bold green]✅ 运行结束[/]")
+            self._write("[bold green]✅ 运行结束[/]")
             self._running = False
         elif etype == "status":
             self._update_status(event)
@@ -188,13 +197,15 @@ class MokioClawApp(App):
 
     def _update_status(self, event: dict[str, Any]) -> None:
         status = self.query_one("#status-panel", Static)
+        passed = event.get("passed")
+        passed_text = "✅ 通过" if passed is True else ("❌ 失败" if passed is False else "—")
         lines = [
             "[b]状态面板[/b]",
-            f"节点：{event.get('node', '')}",
-            f"任务：{event.get('task', '')[:40]}",
+            f"节点：{escape(str(event.get('node', '')))}",
+            f"任务：{escape(str(event.get('task', ''))[:40])}",
             f"Todos：{event.get('todo_done', 0)}/{event.get('todo_total', 0)} 完成",
             f"尝试：{event.get('attempts', 0)}",
-            f"验证：{event.get('passed')}",
+            f"验证：{passed_text}",
             f"Handoffs：{event.get('handoffs', 0)}",
             f"Sources：{event.get('sources', 0)}",
         ]
@@ -207,7 +218,7 @@ class MokioClawApp(App):
         history = memory.get("history_summary_store", {})
         lines = [
             "[b]Memory Snapshot[/b]",
-            f"node: {event.get('node', '')}",
+            f"node: {escape(str(event.get('node', '')))}",
             f"todos: {memory.get('todo_count', len(working.get('todos', [])))}",
             f"notepad: {'有' if history.get('notepad_exists') else '无'}",
             f"history: {'有' if history.get('history_exists') else '无'}",
@@ -229,7 +240,7 @@ class MokioClawApp(App):
             self._write("[yellow]⚠️ 已有任务在运行，请等待完成[/]")
             return
         self._running = True
-        self._write(f"[bold]任务：[/]{task}")
+        self._write(f"[bold]任务：[/]{escape(task)}")
         threading.Thread(target=self._run_agent, args=(task,), daemon=True).start()
 
     def _run_agent(self, task: str) -> None:
