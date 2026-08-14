@@ -91,7 +91,7 @@ class MokioClawApp(App):
     TITLE = "MokioClaw"
     SUB_TITLE = "planner → verifier multi-agent"
     BINDINGS = [
-        ("ctrl+x", "cancel_task", "停止任务"),
+        ("ctrl+x,f9", "cancel_task", "停止任务"),
     ]
     CSS = """
     #timeline {
@@ -150,7 +150,7 @@ class MokioClawApp(App):
             approval_callback=self.bridge.request,  # 高危命令走 TUI 审批桥
         )
         self._approval_in_progress = False
-        self._running = False
+        self._task_running = False
         self._run_generation = 0  # 任务世代号：递增用于「立即取消」判断 + 事件隔离
         self._run_state = "空闲"  # 空闲 / 运行中 / 已停止 / 完成
         self._run_detail = ""
@@ -180,10 +180,10 @@ class MokioClawApp(App):
             self._cancel()
 
     def _cancel(self) -> None:
-        if not self._running:
+        if not self._task_running:
             self._write("[dim]没有正在运行的任务[/]")
             return
-        self._running = False
+        self._task_running = False
         self._run_generation += 1  # 作废旧任务 → 旧线程检测到世代号不匹配即退出
         self.bridge.cancel_all()  # 清理残留审批请求，让旧线程立即返回
         self._run_state = "已停止"
@@ -260,7 +260,7 @@ class MokioClawApp(App):
             self._write(f"[red]⚠️ 错误[/] {detail}")
         elif etype == "run_end":
             self._write("[bold green]✅ 运行结束[/]")
-            self._running = False
+            self._task_running = False
             self._run_state = "完成"
             self._run_detail = ""
             self._refresh_status()
@@ -330,10 +330,10 @@ class MokioClawApp(App):
         event.input.value = ""
         if not task:
             return
-        if self._running:
+        if self._task_running:
             self._write("[yellow]⚠️ 已有任务在运行，按 Ctrl+X 停止后再提交[/]")
             return
-        self._running = True
+        self._task_running = True
         self._run_generation += 1
         gen = self._run_generation
         self._run_state = "运行中"
