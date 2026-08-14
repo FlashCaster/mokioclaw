@@ -14,19 +14,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mokioclaw.core.events import EventBus
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
 class TraceWriter:
-    """旁路观测器：事件写入 workspace/.mokioclaw/trace/，记录失败不影响主流程。"""
+    """旁路观测器：事件写入 workspace/.mokioclaw/trace/，记录失败不影响主流程。
 
-    def __init__(self, workspace: Path):
+    可选的 bus（EventBus）：record 时同时把事件推入总线，供 TUI 实时消费。
+    """
+
+    def __init__(self, workspace: Path, bus: EventBus | None = None):
         self.dir = Path(workspace) / ".mokioclaw" / "trace"
         self.events_path = self.dir / "events.jsonl"
         self.summary_path = self.dir / "summary.json"
         self.timeline_path = self.dir / "timeline.md"
+        self.bus = bus
         self.started_at = _now_iso()
         self._events: list[dict[str, Any]] = []
         self._counters: dict[str, Any] = {
@@ -75,6 +81,8 @@ class TraceWriter:
         self._events.append(event)
         self._append_jsonl(event)
         self._update_counters(event_type, node)
+        if self.bus:
+            self.bus.publish(event)
         return event
 
     def record_tool_call(self, node: str, tool_name: str, args: dict[str, Any] | None = None) -> None:

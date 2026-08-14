@@ -73,7 +73,11 @@ def _resolve_approval(state: RuntimeState, command: str) -> tuple[bool, str]:
     if mode == "deny":
         return False, f"高危命令被拒绝(deny 模式): {command}"
 
-    # inline 模式：交互询问。[y/N] 大写 N 表示默认拒绝（直接回车 = 拒绝，安全优先）
+    # inline 模式：优先用注入的审批回调（TUI 模式），否则交互询问。
+    # [y/N] 大写 N 表示默认拒绝（直接回车 = 拒绝，安全优先）
+    if getattr(state, "approval_callback", None) is not None:
+        approved = bool(state.approval_callback(command))
+        return approved, "已批准" if approved else "用户拒绝"
     answer = input(f"高危命令，批准执行? [y/N] {command}\n> ").strip().lower()
     return answer in ("y", "yes"), "已批准" if answer in ("y", "yes") else "用户拒绝"
 

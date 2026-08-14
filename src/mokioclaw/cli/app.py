@@ -243,5 +243,29 @@ def list_tools() -> None:
     console.print(table)
 
 
+@app.command()
+def tui(
+    workspace: Optional[Path] = typer.Option(
+        None, "-w", "--workspace", help="Workspace directory (auto-created if not provided)"
+    ),
+    approval_mode: str = typer.Option(
+        "inline", "--approval-mode", help="Approval mode for high-risk bash: inline / deny / auto"
+    ),
+    checkpoint_mode: str = typer.Option(
+        "light", "--checkpoint-mode", help="Checkpoint mode: light / strict / off"
+    ),
+) -> None:
+    """Launch the interactive Textual TUI."""
+    from mokioclaw.tui.app import MokioClawApp
+
+    ws = workspace.resolve() if workspace else create_workspace()
+    app_ui = MokioClawApp(
+        workspace=ws,
+        approval_mode=approval_mode,
+        checkpoint_mode=checkpoint_mode,
+    )
+    app_ui.run()
+
+
 if __name__ == "__main__":
     app()

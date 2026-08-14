@@ -19,6 +19,7 @@ class RuntimeState:
     approval_mode: str = "inline"
     checkpoint_mode: str = "light"  # light / strict / off
     trace: Any = None  # TraceWriter | None（旁路观测）
+    approval_callback: Any = None  # callable(command)->bool | None（TUI 审批桥）
 
     @property
     def workspace_str(self) -> str:

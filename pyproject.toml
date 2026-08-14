@@ -12,6 +12,7 @@ dependencies = [
     "tavily-python>=0.7.0",
     "typer>=0.16.0",
     "rich>=13.0.0",
+    "textual>=0.60",
 ]
 
 [project.scripts]
