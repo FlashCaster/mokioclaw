@@ -11,14 +11,14 @@ The verifier uses read-only tools only, so "checking" cannot secretly "fix".
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+from mokioclaw.config import get_context_token_limit as get_context_token_limit_from_config
 
 from mokioclaw.graph.memory import (
     build_layered_memory,
@@ -466,13 +466,7 @@ DEFAULT_CONTEXT_TOKEN_LIMIT = 400000
 
 
 def get_context_token_limit() -> int:
-    load_dotenv()
-    raw = os.getenv("MOKIO_CONTEXT_TOKEN_LIMIT", str(DEFAULT_CONTEXT_TOKEN_LIMIT))
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_CONTEXT_TOKEN_LIMIT
-    return value if value > 0 else DEFAULT_CONTEXT_TOKEN_LIMIT
+    return get_context_token_limit_from_config(DEFAULT_CONTEXT_TOKEN_LIMIT)
 
 
 def estimate_context_tokens(state: MokioGraphState) -> int:

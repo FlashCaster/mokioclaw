@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
+
+from mokioclaw.config import get_tavily_api_key
 
 
 def web_search(
@@ -15,8 +15,7 @@ def web_search(
     include_answer: bool | str = True,
 ) -> dict[str, Any]:
     """Search the web with Tavily and return a compact structured result."""
-    load_dotenv()
-    api_key = os.getenv("TAVILY_API_KEY")
+    api_key = get_tavily_api_key()
     if not api_key:
         return {"ok": False, "error": "missing required .env setting: TAVILY_API_KEY"}
 
